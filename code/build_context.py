@@ -20,6 +20,29 @@ class RequestContext:
     request: pd.Series
     profile: pd.Series
     future_events: pd.DataFrame
+    
+    def normalize_future_events(self):
+        clean_events = self.future_events.copy()
+        
+        exclude = ["cancelled", "failed", "unrealized"]
+        
+        valid = (
+            ~clean_events["status"].isin(exclude)
+            &clean_events["amount"].notna()
+            & ~(
+                (clean_events["status"] == "pending")
+                & (clean_events["direction"] == "credit")
+            )
+        )
+        
+        clean_events = clean_events[valid].copy()
+        
+        clean_events["cash_amount"] = clean_events["amount"].where(
+            clean_events["direction"] == "credit",
+            -clean_events["amount"],
+        )
+        
+        return clean_events
         
     
 def build_context(request_id: str) -> RequestContext:
@@ -72,7 +95,6 @@ def get_future_events(user_events: pd.DataFrame, request_date: pd.Timestamp) -> 
     return future_events.sort_values("settlement_date")
 
 
-
 def normalize_future_events(future_events: pd.DataFrame):
     clean_events = future_events.copy()
     
@@ -91,4 +113,3 @@ def normalize_future_events(future_events: pd.DataFrame):
     
     return clean_events
 
-print(getPossibleStatuses())

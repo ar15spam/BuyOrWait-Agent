@@ -3,3 +3,5 @@ log.txt
 output.csv
 code.zip
 venv/
+__pycache__/
+*.py[cod]

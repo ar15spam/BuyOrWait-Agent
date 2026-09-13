@@ -1,7 +1,9 @@
 log.txt
 .cache/
-output.csv
 code.zip
 venv/
 __pycache__/
 *.py[cod]
+.env
+.env.*
+!.env.example

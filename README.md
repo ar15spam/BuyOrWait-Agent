@@ -1,193 +1,321 @@
-# HackerRank Orchestrate
+# Buy or Wait? — a deterministic financial decision agent
 
-Starter repository for the **HackerRank Orchestrate** 24-hour hackathon (September 2026).
+A personal-finance affordability engine built with **Python**, **pandas**, **pydantic**, and **GPT-4o-mini**, written for the HackerRank Orchestrate 24-hour hackathon (September 2026).
 
-## Buy or Wait?
+Given a user asking *"can I afford this laptop?"*, the system reconstructs their financial position from 25,342 transaction records, forecasts their balance 90 days forward, and decides whether they should pay in full, pay part now, take an installment plan, wait, or not proceed — while keeping them above the minimum balance they asked to protect.
 
-Build an AI-powered financial agent that decides whether a user can safely afford a requested expense.
-
-A user may ask: **"Can I afford this laptop?"**
-
-Answering well takes more than the current balance. The agent must account for recurring expenses, pending payments, essential spending, confirmed income, available payment options, and relevant details buried in messages and images.
-
-For every request, the agent decides whether the user should pay in full, pay partially, use installments, wait, or not proceed. The recommendation must be personalized: two users with the same balance can deserve different answers based on their commitments, priorities, payment preferences, and willingness to adjust flexible expenses.
-
-A recommendation is safe only if the user can complete the full payment plan, cover essential expenses, and stay above their preferred minimum balance throughout the forecast period.
-
-Read [`problem_statement.md`](./problem_statement.md) for the full task spec, input/output schema, allowed values, conflict-resolution rules, and submission format.
+> **Result:** 63.3% on the 25 labelled requests, 250/250 valid output rows, 464 model calls, **$0.0495 total inference cost** ($0.000198 per request), 4.2-second deterministic run.
 
 ---
 
-## Quick Start
+## The result
 
-Clone the repository and move into the project directory:
+Scored against the 25 labelled requests with `make score`:
+
+| Output column | Score |
+|---|---|
+| `amount_safe_to_pay` | 12% exact, **44% within 5%**, 190% MAPE |
+| `affordability_status` | **72%** (4-class) |
+| `recommended_payment_method` | **76%** (5-class) |
+| `payment_plan` | **72%** exact string match |
+| `earliest_date_for_full_payment` | **60%** exact date |
+| `spending_changes_needed` | **88%** set equality |
+| **Headline** (mean of six) | **63.3%** |
+
+25 labelled rows means one request is worth 4 points. I treat every number here as ±8 and made decisions on measured deltas, not single runs.
+
+### Ablation — what each layer was actually worth
+
+| Configuration | Score | Δ |
+|---|---|---|
+| Deterministic only, no model calls | 60.7% | — |
+| \+ vision extraction of 16 blank amounts | 60.7% | **0.0** |
+| \+ message claim extraction and reconciliation | **63.3%** | **+2.6** |
+
+The vision layer resolves all 16 blank amounts correctly and changes the score by nothing, because only 11 of 250 requests touch one and 8 of those sit in history. The message layer touches **97 of 250 requests**. Building the ablation harness first is the only reason I know which of the two deserved the remaining hours.
+
+---
+
+## The problem
+
+| Input | Scale |
+|---|---|
+| Requests to decide | 250 (+25 labelled) |
+| Financial events | 25,342 |
+| User profiles | 275 |
+| Currencies | 5 (EUR, IDR, INR, USD, ZAR) |
+| Dated FX rates | 134 |
+| Seller payment options | 790 |
+| Free-text messages | 215 (multilingual) |
+| Document images | 16 PNGs |
+| Events with a blank amount | 16 |
+
+Every scored field is an exact value — a number, an enum, a date, or a plan string that must reproduce a supplied option character-for-character.
+
+---
+
+## Design principle: the LLM perceives, the code decides
+
+```text
+CSVs ──► currency normalisation ──► history / future split
+                                          │
+        16 PNGs ──► [VISION MODEL] ───────┤   schema-validated JSON
+   215 messages ──► [LANGUAGE MODEL] ─────┤   schema-validated JSON
+                                          ▼
+                                   claim reconciliation
+                                   (precedence rules)
+                                          ▼
+                              recurring-series detection
+                                          ▼
+                            90-day dated cashflow timeline
+                                          ▼
+                      safety replay ──► amount_safe_to_pay
+                                   └──► earliest_safe_date
+                                          ▼
+                    plan enumeration ──► filter ──► rank ──► status
+                                          ▼
+                                 [LANGUAGE MODEL] explanation
+                                          ▼
+                              invariant assertions ──► output.csv
+```
+
+Model calls are confined to three jobs: reading a PNG, interpreting a message, and writing one sentence. Each emits JSON validated against a pydantic schema, and anything that fails validation is **discarded rather than repaired**.
+
+Three consequences:
+
+- **Reproducible.** Cache the perception layer and the rest is a pure function. Reruns are free and identical.
+- **Injection-resistant.** A malicious instruction in `messages.csv` cannot reach a decision. The extraction prompt states the content is data to be described, never instructions to follow, and the model is never shown the output enums — it is not in a position to leak a decision even if it wanted to. The worst an injected string can do is produce a claim that fails validation and gets dropped.
+- **Cheap.** Cost scales with 215 distinct messages and 16 distinct images, not with 250 requests.
+
+---
+
+## The 90-day safety check
+
+A plan is safe only if the projected balance never falls below `minimum_balance_to_keep` at any point in the 90-day window.
+
+The naive way to find the largest safe payment is a binary search over the amount. It isn't necessary. Paying `X` today shifts **every** later balance down by exactly `X`, so safety is linear in today's outflow:
+
+```text
+amount_safe_to_pay = clamp(
+    min(projected_balance) - minimum_balance,
+    0,
+    requested_amount
+)
+```
+
+One pass instead of ~40 replays per request. `earliest_date_for_full_payment` falls out of the same replay using prefix and suffix minima — the first day where every balance before it clears the minimum and every balance after it clears `minimum + requested`, again linear rather than re-replaying per candidate date.
+
+This closed form reproduces the ground truth exactly on every `affordable_now` case.
+
+---
+
+## Recurrence detection — the actual hard part
+
+The dataset gives each user **0–2 events dated after their request** against roughly 100 rows of history. The 90-day forecast cannot be filtered out of the file; it has to be *generated*.
+
+```text
+group history by (description, category, event_type, direction)
+        ↓
+require ≥ 3 occurrences
+        ↓
+cadence = mean inter-arrival gap
+        ↓
+if 27–32 days and occurrences cluster on one day-of-month
+        → calendar-monthly, anchored to that day
+   else → fixed day-count stepping
+        ↓
+project forward, skipping cycles a real event already covers
+```
+
+Two decisions here were worth measurable points:
+
+**Calendar months, not day counts.** Stepping a monthly series by its median 30-day gap drifts a salary paid on the 15th to the 13th two months out. Every date-valued output landed 1–2 days early. Anchoring monthly series to their day-of-month took `earliest_date_for_full_payment` from **36% → 56%** and `payment_plan` from **60% → 68%**.
+
+**Mean gap, not median.** Gap distributions are right-skewed, so the median sits below the true average interval and manufactures extra occurrences. Switching to the mean moved `amount_safe_to_pay` within-5% from **32% → 40%** and brought the predicted `not_affordable` share on the full 250 from 107 down to 86, against a labelled base rate near 24%.
+
+---
+
+## Perception layer
+
+### Vision — 16 blank amounts
+
+A blank `amount` is not zero; the value lives in a linked PNG. The documents are genuinely adversarial: a payslip showing **Total Earnings 4,780,800** *and* **Net Pay 4,365,000**; a rent receipt showing **invoice total 200,000**, **amount received 100,000** and **balance due 100,000**.
+
+The event description decides which line is correct — "August 2019 net salary" means net pay, "Outstanding rent balance" means balance due. The extractor passes the entry's description, category, direction, currency and date alongside the image. Without that context the model is guessing between three plausible totals.
+
+All 16 resolve. An extraction whose reported currency disagrees with the event row is dropped rather than reconciled, because guessing which side is wrong would put an unsupported number into a safety calculation.
+
+### Language — 215 messages, 122 applied claims
+
+Messages clarify, amend, cancel, delay or confirm financial facts, in several languages:
+
+```text
+"Rincian penggajian Anda di Cobalt Systems telah berubah.
+ Gaji bulanan Anda naik menjadi IDR 42750000.
+ Perubahan ini berlaku mulai 2025-08-15."
+
+        ↓ extracted claim
+
+{ "kind": "amend_amount",
+  "target_event_id": "event_136",
+  "new_amount": 42750000,
+  "new_date": "2025-08-15" }
+```
+
+That single claim corrected one request's earliest safe date, status, method and payment plan simultaneously.
+
+Of 158 claims emitted across 215 messages, **122 apply**:
+
+| Claim kind | Applied |
+|---|---|
+| `amend_amount` | 97 |
+| `cancel` | 11 |
+| `delay` | 6 |
+| `confirm` | 4 |
+| `none` | 4 |
+
+The 36 rejections are all principled: 16 name an event ID that does not exist, and 20 are confirmations or settlements against already-settled events, which the spec says must lose to the settled record. **Zero schema failures.**
+
+Conflicts resolve by the spec's precedence order — explicit cancellation or amendment first, then the newer assertion from the same source, then settled over estimate, then the financially safer reading. Every applied and rejected claim is retained in an audit trail.
+
+---
+
+## Measured negative result
+
+Recurrence needs 3+ occurrences, so every one-off and twice-seen debit is dropped. I measured how much that discards: **13.4% of each user's recent spending**. Since 16 of 25 predictions were over-optimistic, carrying it forward as a flat daily rate looked like the obvious correction.
+
+It isn't:
+
+| Residual weight | Score |
+|---|---|
+| 0.0 (off) | **63.3%** |
+| 0.5 | 64.0% |
+| 1.0 | 51.3% |
+| 1.5 | 42.7% |
+
+Adding spending the model is provably missing makes it **12 points worse**. The ground-truth forecast evidently models only detected recurring series and ignores irregular spending entirely.
+
+The code is still in the repo behind `--residual-scale`, defaulting to zero, with the measurement recorded in its docstring. The negative result is more useful than the feature would have been.
+
+---
+
+## Four bugs worth naming
+
+**1. 83% of installment options were silently discarded.** A window guard rejected any plan whose payments extended past `request_date + 90`. That killed 428 of 515 installment options and *every* option for 194 of 275 requests — they could never win regardless of quality. The safety replay already ignores out-of-window payments, so the guard was pure damage.
+
+**2. The message extractor never showed the model any event IDs.** It validated claims against the real ID set afterward but never put that set in the prompt. The model had to invent IDs, and reconciliation would have rejected essentially all of them — 215 calls to change nothing. Supplying a candidate list of the user's events turned the stage from inert into +2.6 points.
+
+**3. A required `asserted_at` field the model always returned as null.** Every claim failed schema validation. The fix was not to loosen the schema but to stop asking: `messages.csv` already carries `sent_at`, so requesting a value already known only added a failure mode and cost tokens. Caught by a three-call smoke test before spending 465.
+
+**4. Cost reported as $0.0000.** The API echoes a dated model id (`gpt-4o-mini-2024-07-18`) and the pricing table was keyed on the base name, so every lookup silently fell through to zero. Now resolved by longest-prefix match, and unpriced models are named explicitly rather than reported as free.
+
+---
+
+## Cost and performance
+
+| Metric | Value |
+|---|---|
+| Model calls | 464 (214 messages, 250 explanations) |
+| Input / output tokens | 266,682 / 15,912 |
+| Total tokens | 282,594 |
+| **Estimated cost** | **$0.0495** |
+| Cost per request | $0.000198 |
+| Model-written explanations | 249 / 250 |
+| Deterministic runtime, 250 requests | **4.2 s** |
+| Cached artifacts | 480 (16 images, 215 messages, 249 explanations) |
+
+Runtime came down from 5.5s by profiling rather than guessing. The largest single win: a residual-spend calculation ran for all 250 requests and was then multiplied by a default weight of zero — a quarter of the runtime spent on a discarded result. Three more followed the same shape: wrapping every row in a fresh `pandas.Series` to read four fields, scanning and re-stringifying all 25,342 event rows once per claim, and re-reading the requests CSV on every request.
+
+Every extraction is cached per artifact and explanations are keyed by prompt hash, so a rerun with unchanged decisions costs nothing and a changed decision is re-explained.
+
+---
+
+## Project structure
+
+4,048 lines across 21 modules.
+
+```text
+code/
+├── main.py             212   pipeline entry point and CLI
+├── build_context.py    305   CSV loading, FX normalisation, per-request context
+├── ledger.py           499   recurrence detection, 90-day timeline
+├── safety.py           170   balance replay, closed-form safe amount
+├── plans.py            396   candidate enumeration, ranking, status derivation
+├── reconcile.py        168   claim precedence and audit trail
+├── validate.py         154   output invariants, asserted before write
+├── writeout.py          32   submission serialisation
+├── usage.py            177   unified token ledger and cost report
+├── explain.py          365   explanation generation, prompt-hash cache
+├── env.py               75   .env loading, secrets never logged
+├── extract/
+│   ├── images.py       263   vision extraction
+│   ├── messages.py     426   claim extraction with candidate grounding
+│   ├── schemas.py       53   strict pydantic models
+│   ├── cache.py         84   per-artifact response cache
+│   └── resolve.py       56   extraction → event amounts
+└── evaluation/
+    ├── score.py        492   per-column scoring, confusion matrices, diffs
+    └── smoke.py        121   one call per stage before spending 465
+```
+
+---
+
+## Running it
 
 ```bash
-git clone https://github.com/interviewstreet/hackerrank-orchestrate-september26.git
-cd hackerrank-orchestrate-september26
+python3 -m venv venv
+venv/bin/pip install pandas pydantic
+cp .env.example .env          # OPENAI_API_KEY=sk-...
 ```
-
-Build your solution in `code/main.py`, or use another language and document its entry point clearly.
-
-Your solution must:
-
-- Read the input files from `dataset/`
-- Generate one prediction for every request
-- Write the final predictions to `output.csv` in the repository root
-
-Run the starter Python entry point with:
 
 ```bash
-python3 code/main.py
+make check     # byte-compile every module
+make test      # unit tests
+make run       # deterministic only, no API key needed
+make smoke     # 3 calls, verifies config before spending 465
+make run-llm   # full pipeline with claims and explanations
+make score     # score the 25 labelled requests
 ```
 
-After running your solution, confirm that `output.csv` exists in the repository root and contains the required columns and one row for every request.
+`make run` produces a complete, valid `output.csv` with no API key at all. The model layers are additive.
 
-## Important File Locations
+Secrets are read from the environment only. `.env` is gitignored and was verified absent from git history.
+
+---
+
+## Limitations
+
+**`amount_safe_to_pay` is 12% exact.** The error is bimodal: seven requests land within 3% and four are catastrophically wrong. Both failure modes trace to recurrence fidelity — the projected amount or cadence of a series — not to the safety mathematics, which is exact.
+
+**The labelled set is 25 rows.** One request is 4 points. Late-stage parameter tuning produced differences inside that noise, so I stopped rather than overfit.
+
+**Recurrence is monthly-or-fixed-interval.** Users whose income is irregular gig payouts rather than a fixed-day salary are modelled poorly; one such user in the labelled set is among the four catastrophic misses.
+
+**Explanations are unverified.** The sentence is generated after the decision is frozen and cannot alter any scored field, but its wording is not checked against the numbers beyond asserting which dates it may name.
+
+---
+
+## What I took away
+
+**Build the scorer before the solver.** The first module written was `score.py`, with a self-test that scoring the labelled file against itself must return exactly 100%. Every subsequent decision was a measured delta. Three of the changes I was most confident about — residual spending, median gaps, parameter tuning — made things worse or did nothing, and I would have shipped all three on intuition.
+
+**Measure the layer before building it.** Vision extraction was the headline feature in my design document and it is worth zero. Ten minutes counting how many requests actually touch a blank amount (11 of 250) would have reordered the whole plan.
+
+**A smoke test that makes three calls.** A required field the model always returned as null would have wasted all 215 message calls. Three calls found it.
+
+**Profile, don't guess.** Every one of the four performance wins was invisible to reading the code and obvious in `cProfile` output.
+
+**Negative results are results.** The residual-spending experiment failed and taught me more about the ground-truth generator than any successful change did.
+
+---
+
+## Tech stack
 
 ```text
-dataset/        Input data and the blank output template. Do not modify the input data.
-code/           Your solution code.
-output.csv      Final generated predictions in the repository root.
-code.zip        ZIP file containing your complete solution for submission.
+Python 3.12
+pandas          dataframe pipeline over 25k events
+pydantic        strict schema validation of all model output
+OpenAI API      gpt-4o-mini, vision and text
+cProfile        performance work
+Make            reproducible entry points
 ```
-
-The blank template at `dataset/output.csv` is provided as a reference. Your final generated file must be the root-level `output.csv`.
-
----
-
-## Repository Layout
-
-```text
-.
-├── AGENTS.md                         # Rules for AI coding tools + transcript logging
-├── problem_statement.md              # Full challenge statement
-├── README.md                         # You are here
-├── code/                             # Your solution code
-├── output.csv                        # Final generated predictions
-└── dataset/
-    ├── requests.csv                  # 250 requests to evaluate — predict these
-    ├── output.csv                    # Blank submission template
-    ├── sample_requests.csv           # 25 solved examples
-    ├── financial_profiles.csv        # Balances, minimum balance, priorities, preferences
-    ├── financial_events.csv          # Historical, pending, and confirmed transactions
-    ├── request_payment_options.csv   # Payment options available per request
-    ├── exchange_rates.csv            # Fixed, dated conversion rates
-    ├── messages.csv                  # Messages tied to users, requests, or events
-    ├── images.csv                    # Payroll letters, statements, bills, receipts
-    └── media/
-        └── images/
-```
-
-Only `dataset/requests.csv` requires predictions. Everything else is context. Join user records with `user_id`, request records with `request_id`, supporting evidence with `related_event_id`, and exchange rates with the rate date and currency pair.
-
-Amounts are in the user's `home_currency` — the dataset uses INR, ZAR, IDR, USD, and EUR, and every conversion rate you need is in `exchange_rates.csv`. All dates are `YYYY-MM-DD`. Live exchange rates, market data, and banking access are not required.
-
----
-
-## What You Need to Build
-
-For every row in `dataset/requests.csv`, produce one row in `output.csv` with:
-
-| Column | Meaning |
-|---|---|
-| `request_id` | The request being answered |
-| `amount_safe_to_pay` | Largest amount safe to pay on `request_date` before optional spending changes, after protecting essentials and the minimum balance |
-| `affordability_status` | `affordable_now`, `affordable_with_plan`, `affordable_later`, or `not_affordable` |
-| `recommended_payment_method` | `full_payment`, `partial_payment`, `installments`, `wait`, or `not_recommended` |
-| `payment_plan` | Chronological `<YYYY-MM-DD>:<amount>` entries joined by `\|`, or `none` |
-| `earliest_date_for_full_payment` | Earliest date the full amount is forecast safe as one payment; empty if never within the forecast |
-| `spending_changes_needed` | Up to three `stop:<event_id>` / `reduce_to:<event_id>:<amount>` changes joined by `\|`, or `none` |
-| `decision_explanation` | Short explanation and the financial facts behind it |
-
-`0 <= amount_safe_to_pay <= requested_amount` must always hold. Installment plans must exactly match a supplied payment option, and only recurring expenses marked flexible may be changed.
-
-`affordable_with_plan` means the full request is completed through a partial-payment schedule, installments, or permitted spending changes. Recommend `partial_payment` only when the request allows it, the user accepts it, `0 < amount_safe_to_pay < requested_amount`, and `earliest_date_for_full_payment` is on or before `desired_completion_date`. Use exactly two payments: pay `amount_safe_to_pay` on `request_date`, then pay the remaining amount on `earliest_date_for_full_payment`. The two payments must add up to `requested_amount`. Unlike installments, partial payment does not need to match a supplied payment option.
-
----
-
-## Suggested Workflow
-
-1. Inspect `dataset/sample_requests.csv` — 25 requests with completed output columns — to understand the expected format and decision style.
-2. Reconstruct each user's financial state from `financial_profiles.csv` and `financial_events.csv`: separate recurring expenses from one-time events, reserve pending transactions, count confirmed salary only on its settlement date, and de-duplicate repeated representations of the same event.
-3. When an event has a blank `amount`, find its `event_id` as `related_event_id` in `images.csv` and extract the amount from the linked image. Never treat a blank amount as zero. Pull in any other relevant messages, images, and payment options for the request.
-4. Forecast forward and generate a plan that keeps the balance above the minimum at every step.
-5. Verify deterministically — bounds, plan feasibility, schedule match, flexible-only spending changes — before writing `output.csv`.
-6. Score yourself on the solved samples, then run the full dataset.
-
-You may use any language or runtime. Python, JavaScript, and TypeScript are all reasonable choices.
-
----
-
-## Requirements
-
-Your solution must:
-
-- be runnable from the terminal
-- read the provided files from `dataset/`
-- produce a valid `output.csv` with the exact required columns in the exact required order
-- include one prediction for every `request_id` in `dataset/requests.csv`
-- not use organizer-only files or hardcoded labels
-- keep behavior deterministic where possible
-
-If you use API keys or secrets, read them from environment variables. Never hardcode secrets in the repo.
-
----
-
-## Evaluation
-
-Your `output.csv` will be compared against hidden ground-truth values.
-
-The scoring will consider:
-
-- accuracy of `amount_safe_to_pay`
-- correctness of `affordability_status`
-- correctness of `recommended_payment_method` and `payment_plan`
-- accuracy of `earliest_date_for_full_payment`
-- validity of `spending_changes_needed`
-- usefulness and consistency of `decision_explanation`
-
-### Token Usage And Cost Analysis
-
-Your `code.zip` must include one token-usage file:
-
-```text
-evaluation/usage_report.md
-```
-
-The report must cover model providers and names, model calls, input and output tokens, total and average tokens per request, estimated total and per-request cost. The reported values must correspond to the final full-dataset run that produced your `output.csv`.
-
----
-
-## Chat Transcript Logging
-
-This repo includes an [`AGENTS.md`](./AGENTS.md) file for AI coding tools. It asks compatible tools to append conversation summaries to a `log.txt` in the repository root — the same directory as `AGENTS.md`:
-
-| Platform | Path |
-|---|---|
-| macOS / Linux | `<repo root>/log.txt` |
-| Windows | `<repo root>\log.txt` |
-
-The path resolves relative to `AGENTS.md`, so it stays correct across clones, renames, and checkouts. `log.txt` is gitignored — upload it as your chat transcript at submission time. Do not paste secrets into the chat.
-
-In case, the harness you are using is not in the repo root, you can explicitly ask the agent to look for the AGENTS.md in this folder & then continue.
-
----
-
-## Submission
-
-Submit the following files as instructed by HackerRank:
-
-| File | Description |
-|---|---|
-| `code.zip` | Full runnable solution, prompts/configuration, README, and the required `evaluation/` folder |
-| `output.csv` | Predictions for every row in `dataset/requests.csv` |
-| `chat_transcript` | The `log.txt` described above, showing how you developed or used the system |
-
-Before submitting, confirm:
-
-- `output.csv` has one row per row in `dataset/requests.csv` (250 rows plus the header).
-- `output.csv` has the exact required columns in the exact required order.
-- Every `amount_safe_to_pay` satisfies `0 <= amount_safe_to_pay <= requested_amount`.
-- Every installment plan matches a supplied payment option, and every spending change targets a flexible recurring expense.
-- Your runnable code, setup instructions, and `evaluation/` folder are included in `code.zip`.

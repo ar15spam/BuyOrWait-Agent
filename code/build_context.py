@@ -13,17 +13,13 @@ from typing import cast
 
 import pandas as pd
 
-
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DATASET_DIR = PROJECT_ROOT / "dataset"
 
-
 profiles = pd.read_csv(DATASET_DIR / "financial_profiles.csv")
 events = pd.read_csv(DATASET_DIR / "financial_events.csv")
-samples = pd.read_csv(DATASET_DIR / "sample_requests.csv")
 exchange_rates = pd.read_csv(DATASET_DIR / "exchange_rates.csv")
 
-samples["request_date"] = pd.to_datetime(samples["request_date"])
 events["event_date"] = pd.to_datetime(events["event_date"])
 events["settlement_date"] = pd.to_datetime(events["settlement_date"])
 events["cash_date"] = events["settlement_date"].fillna(events["event_date"])
@@ -50,6 +46,49 @@ def build_rate_lookup(
 RATES = build_rate_lookup(exchange_rates)
 
 
+def replace_events(new_events: pd.DataFrame) -> None:
+    """Swap in a reconciled event table, keeping the derived cash_date column."""
+    global events
+    frame = new_events.copy()
+    frame["event_date"] = pd.to_datetime(frame["event_date"])
+    frame["settlement_date"] = pd.to_datetime(frame["settlement_date"])
+    frame["cash_date"] = frame["settlement_date"].fillna(frame["event_date"])
+    events = frame
+
+
+def apply_resolved_amounts(resolved: dict[str, float]) -> int:
+    """Fill blank event amounts from the perception layer. Returns rows filled.
+
+    This runs before any history/future split so a resolved amount reaches both
+    the recurrence detector and the forecast. Only genuinely blank amounts are
+    touched; a supplied amount is never overwritten.
+    """
+    if not resolved:
+        return 0
+
+    blank = events["amount"].isna()
+    filled = 0
+    for event_id, amount in resolved.items():
+        match = blank & (events["event_id"] == event_id)
+        if not match.any():
+            continue
+        events.loc[match, "amount"] = float(amount)
+        filled += int(match.sum())
+    return filled
+
+
+def load_requests(requests_path: str | Path = DATASET_DIR / "sample_requests.csv") -> pd.DataFrame:
+    requests = pd.read_csv(requests_path)
+    requests["request_date"] = pd.to_datetime(requests["request_date"])
+    requests["desired_completion_date"] = pd.to_datetime(
+        requests["desired_completion_date"]
+    )
+    return requests
+
+
+samples = load_requests()
+
+
 @dataclass
 class RequestContext:
     home_currency: str
@@ -67,8 +106,23 @@ class RequestContext:
         )
 
 
-def build_context(request_id: str) -> RequestContext:
-    request = get_request(request_id)
+_REQUEST_CACHE: dict[str, pd.DataFrame] = {}
+
+
+def _requests_for(requests_path: str | Path) -> pd.DataFrame:
+    """Read a requests file once per path instead of once per request."""
+    key = str(Path(requests_path).resolve())
+    if key not in _REQUEST_CACHE:
+        _REQUEST_CACHE[key] = load_requests(requests_path)
+    return _REQUEST_CACHE[key]
+
+
+def build_context(
+    request_id: str,
+    requests_path: str | Path = DATASET_DIR / "sample_requests.csv",
+) -> RequestContext:
+    requests = _requests_for(requests_path)
+    request = get_request(request_id, requests)
     user_id = get_user_id(request)
     profile = get_user_profile(user_id)
     past, future = get_past_and_future_events(
@@ -85,8 +139,11 @@ def build_context(request_id: str) -> RequestContext:
     )
 
 
-def get_request(request_id: str) -> pd.Series:
-    matches = samples.loc[samples["request_id"] == request_id]
+def get_request(
+    request_id: str,
+    requests: pd.DataFrame = samples,
+) -> pd.Series:
+    matches = requests.loc[requests["request_id"] == request_id]
     if matches.empty:
         raise ValueError(f"Could not find request: {request_id}")
     return matches.iloc[0]
@@ -96,8 +153,11 @@ def get_user_id(request: pd.Series) -> str:
     return str(request["user_id"])
 
 
-def get_request_date(request_id: str) -> pd.Timestamp:
-    return get_request(request_id)["request_date"]
+def get_request_date(
+    request_id: str,
+    requests_path: str | Path = DATASET_DIR / "sample_requests.csv",
+) -> pd.Timestamp:
+    return get_request(request_id, load_requests(requests_path))["request_date"]
 
 
 def get_user_profile(user_id: str) -> pd.Series:
@@ -107,11 +167,30 @@ def get_user_profile(user_id: str) -> pd.Series:
     return matches.iloc[0]
 
 
+_EVENTS_BY_USER: dict[str, pd.DataFrame] = {}
+_EVENTS_INDEX_TOKEN: int | None = None
+
+
+def _events_by_user() -> dict[str, pd.DataFrame]:
+    """Group the event table by user once, rebuilding only if it is replaced.
+
+    Masking all 25,343 rows for each of 250 requests dominated the run. The
+    token guards against a stale index after reconciliation swaps the table.
+    """
+    global _EVENTS_BY_USER, _EVENTS_INDEX_TOKEN
+    if _EVENTS_INDEX_TOKEN != id(events):
+        _EVENTS_BY_USER = {
+            str(user_id): frame for user_id, frame in events.groupby("user_id", sort=False)
+        }
+        _EVENTS_INDEX_TOKEN = id(events)
+    return _EVENTS_BY_USER
+
+
 def get_user_events(user_id: str) -> pd.DataFrame:
-    user_events = events.loc[events["user_id"] == user_id].copy()
-    if user_events.empty:
+    user_events = _events_by_user().get(str(user_id))
+    if user_events is None or user_events.empty:
         raise ValueError(f"Could not find events for user: {user_id}")
-    return user_events
+    return user_events.copy()
 
 
 def get_possible_statuses() -> list[str]:

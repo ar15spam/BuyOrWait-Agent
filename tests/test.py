@@ -1,11 +1,18 @@
-import code.build_context as bc 
+"""Smoke checks for the ingest and context layer."""
 
-def test_normalize_futures():
-    request_id = "request_01"
-    
-    rc = bc.build_context(request_id)
-    ce = rc.normalize_future_events()
-    print(ce[["event_id", "direction", "amount", "cash_amount"]])
-    
-rc = bc.build_context("request_01")
-print(bc.is_safe_to_pay(rc))
+import code.build_context as bc
+
+
+def test_normalize_future_events_has_signed_amounts():
+    context = bc.build_context("request_01")
+    events = context.normalize_future_events()
+    assert "cash_amount" in events.columns
+    credits = events.loc[events["direction"] == "credit", "cash_amount"]
+    debits = events.loc[events["direction"] == "debit", "cash_amount"]
+    assert (credits >= 0).all()
+    assert (debits <= 0).all()
+
+
+if __name__ == "__main__":
+    test_normalize_future_events_has_signed_amounts()
+    print("ok")

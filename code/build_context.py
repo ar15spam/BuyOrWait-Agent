@@ -200,3 +200,27 @@ def project_balances(context: RequestContext) -> pd.DataFrame:
         opening_balance + projected["cash_amount"].cumsum()
     )
     return projected
+
+def is_safe_to_pay(context):
+    payment = context.request["requested_amount"]
+    minimum_balance = context.profile["minimum_balance_to_keep"]
+    opening_balance = context.profile["current_available_balance"]
+
+    events = context.normalize_future_events()
+
+    balance_after_payment = opening_balance - payment
+
+    balances = (
+        balance_after_payment
+        + events["cash_amount"].cumsum()
+    )
+
+    lowest_future_balance = balances.min()
+
+    lowest_balance = min(
+        balance_after_payment,
+        lowest_future_balance,
+    )
+
+    return lowest_balance >= minimum_balance
+    

@@ -7,4 +7,5 @@ def test_normalize_futures():
     ce = rc.normalize_future_events()
     print(ce[["event_id", "direction", "amount", "cash_amount"]])
     
-test_normalize_futures()
+rc = bc.build_context("request_01")
+print(bc.is_safe_to_pay(rc))
